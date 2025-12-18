@@ -1,0 +1,640 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include "FS.h"
+#include "SD_MMC.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+
+// --- Network Credentials ---
+const char* ssid = "kratos";
+const char* password = "123456789";
+
+// --- Pin Definitions (AI-Thinker ESP32-CAM) ---
+#define PWDN_GPIO_NUM    32
+#define RESET_GPIO_NUM   -1
+#define XCLK_GPIO_NUM     0
+#define SIOD_GPIO_NUM    26
+#define SIOC_GPIO_NUM    27
+#define Y9_GPIO_NUM      35
+#define Y8_GPIO_NUM      34
+#define Y7_GPIO_NUM      39
+#define Y6_GPIO_NUM      36
+#define Y5_GPIO_NUM      21
+#define Y4_GPIO_NUM      19
+#define Y3_GPIO_NUM      18
+#define Y2_GPIO_NUM       5
+#define VSYNC_GPIO_NUM   25
+#define HREF_GPIO_NUM    23
+#define PCLK_GPIO_NUM    22
+#define FLASH_LED_PIN     4
+
+// --- Endpoint Buffer Structure ---
+struct EndpointBuffer {
+  uint8_t* data;
+  size_t len;
+  bool ready;
+};
+
+// --- Globals & state ---
+AsyncWebServer server(80);
+
+enum SystemMode { MODE_IDLE, MODE_STREAMING, MODE_RECORDING };
+SystemMode currentMode = MODE_IDLE;
+
+unsigned long recordingStartTime = 0;
+const unsigned long segmentDuration = 3600 * 1000UL; // 1 hour
+File videoFile;
+char currentFileName[30];
+const uint64_t STORAGE_THRESHOLD = 2ULL * 1024ULL * 1024ULL * 1024ULL; // 2GB
+
+unsigned long frameCount = 0;
+float currentFPS = 0;
+unsigned long lastFPSTime = 0;
+
+// Double buffering for endpoint
+const size_t MAX_JPEG_SIZE = 50000;  // 50KB max for CIF JPEG
+EndpointBuffer endpointBuffers[2];
+volatile uint8_t writeBufferIndex = 0;  // Camera writes here
+volatile uint8_t readBufferIndex = 1;   // Endpoint reads here
+SemaphoreHandle_t bufferSwapMutex = nullptr;
+
+TaskHandle_t cameraTaskHandle = nullptr;
+
+bool streamingConfigured = false; // Track if streaming settings applied
+
+// --- Web UI ---
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <title>ESP32-CAM High FPS Controller</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #1a1a1a; color: white; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; color: #4CAF50; }
+    .status-bar { background: #333; padding: 15px; border-radius: 8px; text-align: center; margin-bottom: 20px; }
+    .status-value { font-size: 24px; font-weight: bold; }
+    .controls { background: #333; padding: 20px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
+    .stream-container { text-align: center; background: #222; padding: 10px; border-radius: 10px; min-height: 240px;}
+    .stream-img { max-width: 100%; height: auto; border-radius: 8px; }
+    button { background: #007bff; color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; margin: 5px; font-size: 16px; }
+    button:hover { opacity: 0.9; }
+    button.stop-btn { background: #f44336; }
+    #mode-status { transition: color 0.3s; }
+    .fps-indicator { font-size: 14px; color: #4CAF50; font-weight: bold; }
+    .perf-stats { font-size: 11px; color: #888; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ESP32-CAM High Performance Controller</h1>
+    
+    <div class="status-bar">
+      <div>Current Mode</div>
+      <div class="status-value" id="mode-status">IDLE</div>
+      <div class="fps-indicator">Stream FPS: <span id="fps">0.0</span> | Target: 10+ FPS</div>
+      <div class="perf-stats">
+        Heap: <span id="heap">0</span> KB | SD: <span id="sd_space">0.00</span> GB | 
+        Load: <span id="frame-time">0</span>ms
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="stream-btn" onclick="startStream()">Start Stream</button>
+      <button id="record-btn" onclick="startRecording()">Start Recording</button>
+      <button id="stop-btn" class="stop-btn" onclick="stopAll()">Stop</button>
+    </div>
+
+    <div class="stream-container">
+      <img id="stream" class="stream-img" style="display: none;">
+      <div id="stream-placeholder" style="color: #666; padding: 50px;">
+        High-performance stream will appear here<br>
+        <small>Optimized for 10+ FPS</small>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const streamImg = document.getElementById('stream');
+    const streamPlaceholder = document.getElementById('stream-placeholder');
+    const modeStatus = document.getElementById('mode-status');
+    
+    let frameCount = 0;
+    let lastFrameTime = Date.now();
+    let currentFPS = 0;
+    let isStreaming = false;
+    let frameLoadTime = 0;
+
+    function updateStatus() {
+      fetch('/stats')
+        .then(response => response.json())
+        .then(data => {
+          modeStatus.textContent = data.mode;
+          document.getElementById('sd_space').textContent = data.sd_free_gb.toFixed(2);
+          document.getElementById('heap').textContent = (data.heap / 1024).toFixed(0);
+          document.getElementById('fps').textContent = currentFPS.toFixed(1);
+          document.getElementById('frame-time').textContent = frameLoadTime;
+          
+          if (data.mode === 'RECORDING') {
+            modeStatus.style.color = '#f44336';
+          } else if (data.mode === 'STREAMING') {
+            modeStatus.style.color = '#4CAF50';
+          } else {
+            modeStatus.style.color = '#ffffff';
+          }
+        });
+    }
+
+    function startStream() {
+      stopAll();
+      streamPlaceholder.style.display = 'none';
+      streamImg.style.display = 'block';
+      isStreaming = true;
+      frameCount = 0;
+      lastFrameTime = Date.now();
+      loadFrame();
+    }
+    
+    function loadFrame() {
+      if (!isStreaming) return;
+      
+      const loadStart = Date.now();
+      const img = new Image();
+      
+      img.onload = function() {
+        streamImg.src = img.src;
+        frameCount++;
+        
+        const now = Date.now();
+        frameLoadTime = now - loadStart;
+        
+        // Calculate FPS every second
+        if (now - lastFrameTime >= 1000) {
+          currentFPS = frameCount / ((now - lastFrameTime) / 1000);
+          frameCount = 0;
+          lastFrameTime = now;
+        }
+        
+        // Immediate next frame request for maximum FPS
+        setTimeout(loadFrame, 20);
+      };
+      
+      img.onerror = function() {
+        console.log('Frame error, retrying...');
+        setTimeout(loadFrame, 100);
+      };
+      
+      img.src = '/frame?t=' + Date.now();
+    }
+    
+    function startRecording() {
+      stopAll();
+      fetch('/recording/start');
+    }
+    
+    function stopAll() {
+      isStreaming = false;
+      streamImg.style.display = 'none';
+      streamPlaceholder.style.display = 'block';
+      streamImg.src = '';
+      fetch('/stop');
+    }
+    
+    setInterval(updateStatus, 1000);
+    window.onload = updateStatus;
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// --- Function prototypes ---
+void cameraTask(void* parameter);
+void setupCamera();
+void setupWebServer();
+void setupEndpointBuffers();
+void startRecording();
+void stopRecording();
+void recordFrame();
+void manageStorage();
+String getModeString();
+void configureStreamingMode();
+
+// --- Setup Endpoint Buffers ---
+void setupEndpointBuffers() {
+  bufferSwapMutex = xSemaphoreCreateMutex();
+  if (!bufferSwapMutex) {
+    Serial.println("ERROR: Failed to create buffer swap mutex!");
+    return;
+  }
+  
+  for (int i = 0; i < 2; i++) {
+    // Try PSRAM first for better performance
+    endpointBuffers[i].data = (uint8_t*)heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM);
+    if (!endpointBuffers[i].data) {
+      Serial.printf("PSRAM allocation failed for buffer %d, using regular heap\n", i);
+      endpointBuffers[i].data = (uint8_t*)malloc(MAX_JPEG_SIZE);
+    }
+    
+    if (!endpointBuffers[i].data) {
+      Serial.printf("CRITICAL: Failed to allocate endpoint buffer %d!\n", i);
+      return;
+    }
+    
+    endpointBuffers[i].len = 0;
+    endpointBuffers[i].ready = false;
+    Serial.printf("Endpoint buffer %d allocated: %d bytes\n", i, MAX_JPEG_SIZE);
+  }
+  
+  Serial.println("Endpoint double buffers initialized successfully");
+}
+
+// --- Camera Task for continuous capture ---
+void cameraTask(void* parameter) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(50); // ~20 FPS capture target
+  
+  while (true) {
+    if (currentMode == MODE_STREAMING) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) {
+        // Check if frame fits in our buffers
+        if (fb->len <= MAX_JPEG_SIZE) {
+          // Non-blocking attempt to write to endpoint buffer
+          if (xSemaphoreTake(bufferSwapMutex, 0) == pdTRUE) {
+            uint8_t writeIdx = writeBufferIndex;
+            
+            // Copy frame data to endpoint buffer
+            memcpy(endpointBuffers[writeIdx].data, fb->buf, fb->len);
+            endpointBuffers[writeIdx].len = fb->len;
+            endpointBuffers[writeIdx].ready = true;
+            
+            // Atomic buffer swap
+            uint8_t temp = writeBufferIndex;
+            writeBufferIndex = readBufferIndex;
+            readBufferIndex = temp;
+            
+            xSemaphoreGive(bufferSwapMutex);
+          }
+          // If mutex is locked, skip this frame (endpoint is busy serving)
+        } else {
+          Serial.printf("Frame too large: %d bytes (max: %d)\n", fb->len, MAX_JPEG_SIZE);
+        }
+        
+        // Always return camera buffer immediately - never blocks
+        esp_camera_fb_return(fb);
+      }
+    }
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n\n=== ESP32-CAM Optimized Double Buffer Controller ===");
+
+  // Initialize SD card (do not return on failure)
+  if (!SD_MMC.begin()) {
+    Serial.println("WARNING: SD Card Mount Failed! Continuing without SD.");
+  } else {
+    uint64_t cs = SD_MMC.cardSize();
+    Serial.printf("SD Card Size: %.2f GB\n", (float)cs / (1024.0 * 1024.0 * 1024.0));
+  }
+
+  // Max CPU freq
+  setCpuFrequencyMhz(240);
+  Serial.println("CPU set to 240MHz");
+
+  setupCamera();
+  setupEndpointBuffers();  // Initialize double buffers
+
+  // --- DHCP WiFi connect ---
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+
+  Serial.printf("Connecting to WiFi SSID '%s' ...\n", ssid);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("MAC Address: ");
+    Serial.println(WiFi.macAddress());
+  } else {
+    Serial.printf("WiFi not connected (status=%d)\n", WiFi.status());
+  }
+
+  setupWebServer();
+  server.begin();
+  Serial.println("Web server started.");
+  if (WiFi.isConnected()) {
+    Serial.printf("Access at: http://%s\n", WiFi.localIP().toString().c_str());
+  }
+
+  // Create camera task
+  xTaskCreatePinnedToCore(
+    cameraTask,
+    "CameraTask",
+    4096,
+    nullptr,
+    2,
+    &cameraTaskHandle,
+    0
+  );
+  Serial.println("Camera task started on Core 0");
+}
+
+void loop() {
+  // Main recording logic
+  if (currentMode == MODE_RECORDING) {
+    if (millis() - recordingStartTime >= segmentDuration) {
+      Serial.println("Segment duration reached. Rotating file.");
+      stopRecording();
+      startRecording();
+    }
+    recordFrame();
+  }
+
+  // Update FPS counter
+  unsigned long now = millis();
+  if (now - lastFPSTime >= 1000) {
+    currentFPS = frameCount;
+    frameCount = 0;
+    lastFPSTime = now;
+  }
+
+  vTaskDelay(1);
+}
+
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_CIF;
+    config.jpeg_quality = 20;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    Serial.println("PSRAM found - optimized settings");
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 25;
+    config.fb_count = 1;
+    Serial.println("No PSRAM - minimal settings");
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed (0x%x)\n", err);
+    return;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, config.frame_size);
+    s->set_quality(s, config.jpeg_quality);
+    Serial.println("Camera initialized");
+  }
+}
+
+void configureStreamingMode() {
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    s->set_special_effect(s, 2); // Grayscale for speed
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 50);
+    s->set_saturation(s, 2);
+    Serial.println("Streaming mode configured");
+  }
+  streamingConfigured = true;
+}
+
+void setupWebServer() {
+  // Serve main page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Stats endpoint
+  server.on("/stats", HTTP_GET, [](AsyncWebServerRequest *request){
+    float sdFreeGB = 0.0;
+    if (SD_MMC.begin()) {
+      sdFreeGB = (float)(SD_MMC.cardSize() - SD_MMC.usedBytes()) / (1024.0 * 1024.0 * 1024.0);
+    }
+    String json = "{";
+    json += "\"mode\":\"" + getModeString() + "\",";
+    json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"fps\":" + String(currentFPS, 1) + ",";
+    json += "\"sd_free_gb\":" + String(sdFreeGB, 2);
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  // OPTIMIZED: Frame endpoint with double buffering
+  server.on("/frame", HTTP_GET, [](AsyncWebServerRequest *request){
+    // First frame request initializes streaming mode
+    if (currentMode == MODE_IDLE) {
+      currentMode = MODE_STREAMING;
+      configureStreamingMode();
+      frameCount = 0;
+      lastFPSTime = millis();
+      
+      // Reset buffers
+      if (xSemaphoreTake(bufferSwapMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        endpointBuffers[0].ready = false;
+        endpointBuffers[1].ready = false;
+        xSemaphoreGive(bufferSwapMutex);
+      }
+      
+      Serial.println("Streaming started on first frame request");
+    }
+
+    if (currentMode != MODE_STREAMING) {
+      request->send(503, "text/plain", "Not streaming");
+      return;
+    }
+
+    // Read from the read buffer (non-blocking)
+    if (xSemaphoreTake(bufferSwapMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      uint8_t readIdx = readBufferIndex;
+      
+      if (endpointBuffers[readIdx].ready && endpointBuffers[readIdx].len > 0) {
+        // Send directly from our stable buffer
+        // beginResponse_P copies the data, so buffer remains valid
+        AsyncWebServerResponse *response = request->beginResponse_P(
+          200, 
+          "image/jpeg", 
+          endpointBuffers[readIdx].data, 
+          endpointBuffers[readIdx].len
+        );
+        response->addHeader("Cache-Control", "no-cache");
+        response->addHeader("Connection", "close");
+        request->send(response);
+        
+        // Mark as consumed (camera can overwrite this buffer)
+        endpointBuffers[readIdx].ready = false;
+        frameCount++;
+        
+        xSemaphoreGive(bufferSwapMutex);
+      } else {
+        xSemaphoreGive(bufferSwapMutex);
+        request->send(503, "text/plain", "No frame ready");
+      }
+    } else {
+      request->send(503, "text/plain", "Busy");
+    }
+  });
+
+  // Start recording
+  server.on("/recording/start", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(currentMode != MODE_IDLE) {
+      request->send(409, "text/plain", "Device is busy");
+      return;
+    }
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != NULL) {
+      s->set_special_effect(s, 0);
+      s->set_framesize(s, FRAMESIZE_VGA);
+      s->set_quality(s, 10);
+      s->set_saturation(s, 0);
+    }
+    startRecording();
+    request->send(200, "text/plain", "Recording started");
+  });
+
+  // Stop all
+  server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
+    stopRecording();
+    currentMode = MODE_IDLE;
+    streamingConfigured = false;
+
+    // Clear endpoint buffers
+    if (xSemaphoreTake(bufferSwapMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      endpointBuffers[0].ready = false;
+      endpointBuffers[1].ready = false;
+      endpointBuffers[0].len = 0;
+      endpointBuffers[1].len = 0;
+      xSemaphoreGive(bufferSwapMutex);
+    }
+
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != NULL) {
+      s->set_special_effect(s, 0);
+      s->set_framesize(s, FRAMESIZE_CIF);
+      s->set_quality(s, 20);
+    }
+
+    Serial.println("Stopped");
+    request->send(200, "text/plain", "Stopped");
+  });
+}
+
+void startRecording() {
+  manageStorage();
+
+  int videoFileNumber = 0;
+  do {
+    videoFileNumber++;
+    sprintf(currentFileName, "/rec_%03d.mjpg", videoFileNumber);
+  } while (SD_MMC.exists(currentFileName) && videoFileNumber < 999);
+
+  videoFile = SD_MMC.open(currentFileName, FILE_WRITE);
+
+  if (!videoFile) {
+    Serial.println("Failed to open file for writing!");
+    currentMode = MODE_IDLE;
+    return;
+  }
+
+  currentMode = MODE_RECORDING;
+  recordingStartTime = millis();
+  Serial.printf("Recording started: %s\n", currentFileName);
+}
+
+void stopRecording() {
+  if (currentMode == MODE_RECORDING && videoFile) {
+    videoFile.close();
+    Serial.printf("Recording saved: %s\n", currentFileName);
+  }
+  currentMode = MODE_IDLE;
+}
+
+void recordFrame() {
+  if (!videoFile) return;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  videoFile.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void manageStorage() {
+  if (!SD_MMC.begin()) return;
+  uint64_t freeSpace = SD_MMC.cardSize() - SD_MMC.usedBytes();
+  if (freeSpace < STORAGE_THRESHOLD) {
+    Serial.println("Managing storage...");
+    File root = SD_MMC.open("/");
+    File file = root.openNextFile();
+    String oldestName = "";
+    int oldestNum = INT_MAX;
+
+    while (file) {
+      String fileName = file.name();
+      if (fileName.startsWith("/rec_") && fileName.endsWith(".mjpg")) {
+        int fileNum = fileName.substring(5, 8).toInt();
+        if (fileNum < oldestNum) {
+          oldestNum = fileNum;
+          oldestName = fileName;
+        }
+      }
+      file = root.openNextFile();
+    }
+    root.close();
+
+    if (oldestName.length() > 0) {
+      Serial.printf("Deleting oldest: %s\n", oldestName.c_str());
+      SD_MMC.remove(oldestName.c_str());
+    }
+  }
+}
+
+String getModeString() {
+  switch(currentMode) {
+    case MODE_IDLE: return "IDLE";
+    case MODE_STREAMING: return "STREAMING";
+    case MODE_RECORDING: return "RECORDING";
+    default: return "UNKNOWN";
+  }
+}
